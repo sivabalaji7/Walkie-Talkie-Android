@@ -9,7 +9,7 @@
         android:id="@+id/titleText"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Bluetooth Walkie-Talkie"
+        android:text="Walkie-Talkie"
         android:textColor="#FFFFFF"
         android:textSize="24sp"
         android:textStyle="bold" />
@@ -22,6 +22,24 @@
         android:text="Checking permissions..."
         android:textColor="#B8C4CC"
         android:textSize="16sp" />
+
+    <TextView
+        android:id="@+id/debugText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:background="#15242E"
+        android:padding="10dp"
+        android:text="Voice debug: idle"
+        android:textColor="#85D6FF"
+        android:textSize="12sp" />
+
+    <Button
+        android:id="@+id/modeButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="Transport: Bluetooth" />
 
     <LinearLayout
         android:layout_width="match_parent"
