@@ -1,475 +1,395 @@
 package com.example.walkietalkieapp
 
-import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothManager as SystemBluetoothManager
-import android.content.BroadcastReceiver
-import android.content.Context
-import android.content.Intent
-import android.content.IntentFilter
+import android.Manifest
 import android.content.pm.PackageManager
-import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.view.MotionEvent
-import android.widget.ArrayAdapter
-import android.widget.Button
-import android.widget.ListView
-import android.widget.TextView
-import android.widget.Toast
+import android.util.Log
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import com.example.walkietalkieapp.audio.AudioPlayer
-import com.example.walkietalkieapp.audio.AudioRecorder
-import com.example.walkietalkieapp.bluetooth.BluetoothManager
+import com.example.walkietalkieapp.socket.SignalingListener
+import com.example.walkietalkieapp.socket.SocketUiState
+import com.example.walkietalkieapp.socket.SocketManager
+import com.example.walkietalkieapp.webrtc.WebRTCManager
+import com.example.walkietalkieapp.ui.theme.WalkieTalkieAppTheme
 
-class MainActivity : AppCompatActivity() {
-    companion object {
-        private const val VOICE_GATE_THRESHOLD = 1400.0
-        private const val REMOTE_AUDIO_SUPPRESSION_MS = 300L
-        private const val TRANSMIT_HANGOVER_MS = 220L
-    }
+private const val TAG = "WalkieTalkieApp"
 
-    private val recorder = AudioRecorder()
-    private val player = AudioPlayer()
-    private lateinit var bluetoothAdapter: BluetoothAdapter
-    private lateinit var btManager: BluetoothManager
-    private lateinit var statusText: TextView
-    private lateinit var enableBluetoothButton: Button
-    private lateinit var discoverableButton: Button
-    private lateinit var scanButton: Button
-    private lateinit var pttButton: Button
-    private lateinit var devicesListView: ListView
-    private lateinit var devicesAdapter: ArrayAdapter<String>
+class MainActivity : ComponentActivity(), SignalingListener {
+    private var hasAudioPermission by mutableStateOf(false)
+    private var hasRequestedAudioPermission by mutableStateOf(false)
+    private var shouldShowAudioPermissionRationale by mutableStateOf(false)
+    
+    private var webRTCManager: WebRTCManager? = null
 
-    private val devices = linkedMapOf<String, BluetoothDevice>()
-    private var pendingConnectDevice: BluetoothDevice? = null
-    private var receiverRegistered = false
-    private val mainHandler = Handler(Looper.getMainLooper())
-    @Volatile
-    private var isLocallyTransmitting = false
-    @Volatile
-    private var lastRemoteAudioAt = 0L
-    @Volatile
-    private var localTransmitHoldUntil = 0L
+    private val audioPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+            hasRequestedAudioPermission = true
+            hasAudioPermission = isGranted
+            shouldShowAudioPermissionRationale =
+                !isGranted && shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)
 
-    private val permissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { results ->
-            if (results.values.all { it }) {
-                initializeBluetooth()
-            } else {
-                updateStatus("Permissions are required for Bluetooth voice and scanning.")
-                showToast("Grant microphone and Bluetooth permissions to continue.")
+            if (isGranted) {
+                initializeWebRTC()
             }
         }
 
-    private val enableBluetoothLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            if (bluetoothAdapter.isEnabled) {
-                initializeBluetooth()
-            } else {
-                updateStatus("Bluetooth is off. Turn it on to connect devices.")
-            }
-        }
-
-    private val discoverableLauncher =
-        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            if (bluetoothAdapter.scanMode == BluetoothAdapter.SCAN_MODE_CONNECTABLE_DISCOVERABLE) {
-                updateStatus("This phone is visible. Use the other phone to scan and pair.")
-            }
-        }
-
-    private val discoveryReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context?, intent: Intent?) {
-            when (intent?.action) {
-                BluetoothDevice.ACTION_FOUND -> {
-                    val device = extractBluetoothDevice(intent)
-                    if (device != null) {
-                        addOrUpdateDevice(device)
-                    }
-                }
-
-                BluetoothAdapter.ACTION_DISCOVERY_STARTED -> {
-                    updateStatus("Scanning for nearby Bluetooth devices...")
-                }
-
-                BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-                    if (!btManager.isConnected()) {
-                        updateStatus("Scan finished. Tap a device to pair or connect.")
-                    }
-                }
-
-                BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
-                    val device = extractBluetoothDevice(intent)
-                    val state = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
-                    if (device != null) {
-                        addOrUpdateDevice(device)
-                        if (state == BluetoothDevice.BOND_BONDED && device.address == pendingConnectDevice?.address) {
-                            bluetoothAdapter.cancelDiscovery()
-                            mainHandler.postDelayed({
-                                if (pendingConnectDevice?.address == device.address) {
-                                    pendingConnectDevice = null
-                                    connectToDevice(device)
-                                }
-                            }, 1000)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    @SuppressLint("ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        refreshAudioPermissionState()
+        
+        if (hasAudioPermission) {
+            initializeWebRTC()
+        }
+        
+        SocketManager.setSignalingListener(this)
+        SocketManager.initialize()
+        SocketManager.connect()
 
-        statusText = findViewById(R.id.statusText)
-        enableBluetoothButton = findViewById(R.id.enableBluetoothButton)
-        discoverableButton = findViewById(R.id.discoverableButton)
-        scanButton = findViewById(R.id.scanButton)
-        pttButton = findViewById(R.id.pttButton)
-        devicesListView = findViewById(R.id.devicesListView)
+        setContent {
+            val socketUiState by SocketManager.socketUiState.collectAsState()
 
-        bluetoothAdapter = getSystemService(SystemBluetoothManager::class.java)?.adapter
-            ?: run {
-                updateStatus("Bluetooth is not supported on this device.")
-                showToast("Bluetooth is not supported on this phone.")
-                return
-            }
-
-        btManager = BluetoothManager(
-            onConnected = { device, incoming ->
-                runOnUiThread {
-                    bluetoothAdapter.cancelDiscovery()
-                    pendingConnectDevice = null
-                    player.start()
-                    updatePttEnabled(true)
-                    addOrUpdateDevice(device)
-                    val role = if (incoming) "Host" else "Client"
-                    updateStatus("$role channel active with ${deviceLabel(device)}.")
-                    showToast("Connected to ${deviceLabel(device)}")
-                }
-            },
-            onDisconnected = {
-                runOnUiThread {
-                    updatePttEnabled(false)
-                    recorder.stop()
-                    updateStatus("Connection closed. The phone is listening for a new device.")
-                }
-            },
-            onAudioReceived = { data ->
-                lastRemoteAudioAt = android.os.SystemClock.elapsedRealtime()
-                player.play(data)
-            },
-            onError = { message ->
-                runOnUiThread {
-                    updateStatus(message)
-                    showToast(message)
+            WalkieTalkieAppTheme {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background
+                ) {
+                    WalkieTalkieScreen(
+                        hasAudioPermission = hasAudioPermission,
+                        hasRequestedAudioPermission = hasRequestedAudioPermission,
+                        shouldShowAudioPermissionRationale = shouldShowAudioPermissionRationale,
+                        socketUiState = socketUiState,
+                        onRequestAudioPermission = ::requestAudioPermission,
+                        onConnectSocket = { SocketManager.connect() },
+                        onDisconnectSocket = { SocketManager.disconnect() },
+                        onSendTestMessage = {
+                            SocketManager.sendMessage("hello")
+                        },
+                        onStartPushToTalk = ::startPushToTalk,
+                        onStopPushToTalk = ::stopPushToTalk
+                    )
                 }
             }
-        )
-
-        devicesAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, mutableListOf())
-        devicesListView.adapter = devicesAdapter
-        registerDiscoveryReceiver()
-
-        enableBluetoothButton.setOnClickListener {
-            requestBluetoothEnable()
         }
+    }
 
-        discoverableButton.setOnClickListener {
-            if (ensurePermissions()) {
-                requestDiscoverableMode()
+    private fun initializeWebRTC() {
+        if (webRTCManager != null) return
+        
+        try {
+            webRTCManager = WebRTCManager(this).apply {
+                init()
+                initialize()
+                createPeerConnection()
             }
+            Log.d(TAG, "WebRTC initialization completed")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize WebRTC: ${e.message}", e)
         }
+    }
 
-        scanButton.setOnClickListener {
-            if (ensurePermissions()) {
-                startDiscovery()
-            }
-        }
-
-        devicesListView.setOnItemClickListener { _, _, position, _ ->
-            val device = devices.values.elementAtOrNull(position) ?: return@setOnItemClickListener
-            if (!ensurePermissions()) {
-                return@setOnItemClickListener
-            }
-
-            if (device.bondState == BluetoothDevice.BOND_BONDED) {
-                bluetoothAdapter.cancelDiscovery()
-                connectToDevice(device)
-            } else {
-                pendingConnectDevice = device
-                bluetoothAdapter.cancelDiscovery()
-                updateStatus("Pairing with ${deviceLabel(device)}...")
-                device.createBond()
-            }
-        }
-
-        pttButton.setOnTouchListener { _, event ->
-            if (!btManager.isConnected()) {
-                showToast("Connect to another phone first.")
-                return@setOnTouchListener false
-            }
-
-            when (event.action) {
-                MotionEvent.ACTION_DOWN -> {
-                    pttButton.text = "Talking..."
-                    recorder.start { data ->
-                        val shouldTransmit = shouldTransmitFrame(data)
-                        setLocalTransmitState(shouldTransmit)
-                        if (shouldTransmit) {
-                            btManager.send(data)
-                        }
-                    }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    pttButton.text = "Hold To Talk"
-                    recorder.stop()
-                    setLocalTransmitState(false)
-                    true
-                }
-                MotionEvent.ACTION_CANCEL -> {
-                    pttButton.text = "Hold To Talk"
-                    recorder.stop()
-                    setLocalTransmitState(false)
-                    true
-                }
-                else -> false
-            }
-        }
-
-        updatePttEnabled(false)
-
-        if (ensurePermissions()) {
-            initializeBluetooth()
-        }
+    override fun onResume() {
+        super.onResume()
+        refreshAudioPermissionState()
     }
 
     override fun onDestroy() {
+        SocketManager.setSignalingListener(null)
+        SocketManager.disconnect()
+        webRTCManager?.cleanup()
         super.onDestroy()
-        mainHandler.removeCallbacksAndMessages(null)
-        if (receiverRegistered) {
-            unregisterReceiver(discoveryReceiver)
-        }
-        if (::bluetoothAdapter.isInitialized) {
-            bluetoothAdapter.cancelDiscovery()
-        }
-        if (::btManager.isInitialized) {
-            btManager.stop()
-        }
-        recorder.release()
-        player.release()
     }
 
-    private fun ensurePermissions(): Boolean {
-        val missingPermissions = requiredPermissions().filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
+    private fun requestAudioPermission() {
+        if (hasAudioPermission) return
+        hasRequestedAudioPermission = true
+        audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+    }
 
-        return if (missingPermissions.isEmpty()) {
-            true
-        } else {
-            permissionLauncher.launch(missingPermissions.toTypedArray())
-            false
+    private fun refreshAudioPermissionState() {
+        hasAudioPermission = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+
+        shouldShowAudioPermissionRationale =
+            !hasAudioPermission && shouldShowRequestPermissionRationale(Manifest.permission.RECORD_AUDIO)
+    }
+
+    override fun onOfferReceived(sdp: String) {
+        runOnUiThread {
+            Log.d(TAG, "Offer received, handling on UI thread")
+            webRTCManager?.handleOffer(sdp)
         }
     }
 
-    private fun requiredPermissions(): List<String> {
-        val permissions = mutableListOf(android.Manifest.permission.RECORD_AUDIO)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            permissions += listOf(
-                android.Manifest.permission.BLUETOOTH_CONNECT,
-                android.Manifest.permission.BLUETOOTH_SCAN
+    override fun onAnswerReceived(sdp: String) {
+        runOnUiThread {
+            Log.d(TAG, "Answer received, handling on UI thread")
+            webRTCManager?.handleAnswer(sdp)
+        }
+    }
+
+    override fun onIceCandidateReceived(candidate: String) {
+        runOnUiThread {
+            Log.d(TAG, "ICE Candidate received, handling on UI thread")
+            webRTCManager?.handleIceCandidate(candidate)
+        }
+    }
+    
+    private fun startPushToTalk() {
+        if (!hasAudioPermission) {
+            requestAudioPermission()
+            return
+        }
+        
+        if (webRTCManager == null) {
+            initializeWebRTC()
+        }
+        
+        Log.d(TAG, "Push-to-talk started")
+        webRTCManager?.startAudioCapture()
+        webRTCManager?.createOffer()
+    }
+    
+    private fun stopPushToTalk() {
+        Log.d(TAG, "Push-to-talk stopped")
+        webRTCManager?.stopAudio()
+    }
+}
+
+@Composable
+fun WalkieTalkieScreen(
+    hasAudioPermission: Boolean,
+    hasRequestedAudioPermission: Boolean,
+    shouldShowAudioPermissionRationale: Boolean,
+    socketUiState: SocketUiState,
+    onRequestAudioPermission: () -> Unit,
+    onConnectSocket: () -> Unit,
+    onDisconnectSocket: () -> Unit,
+    onSendTestMessage: () -> Unit,
+    onStartPushToTalk: () -> Unit,
+    onStopPushToTalk: () -> Unit
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
+    var wasPressed by remember { mutableStateOf(false) }
+    val screenScrollState = rememberScrollState()
+
+    LaunchedEffect(isPressed) {
+        if (isPressed) {
+            wasPressed = true
+            onStartPushToTalk()
+        } else if (wasPressed) {
+            wasPressed = false
+            onStopPushToTalk()
+        }
+    }
+
+    val buttonContainerColor = when {
+        isPressed -> MaterialTheme.colorScheme.primaryContainer
+        hasAudioPermission -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.secondaryContainer
+    }
+    val buttonContentColor = when {
+        isPressed -> MaterialTheme.colorScheme.onPrimaryContainer
+        hasAudioPermission -> MaterialTheme.colorScheme.onPrimary
+        else -> MaterialTheme.colorScheme.onSecondaryContainer
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(screenScrollState)
+            .padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = "Walkie Talkie App",
+            style = MaterialTheme.typography.headlineMedium
+        )
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = if (socketUiState.isConnected) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant
+                }
             )
-        } else {
-            permissions += listOf(
-                android.Manifest.permission.BLUETOOTH,
-                android.Manifest.permission.BLUETOOTH_ADMIN,
-                android.Manifest.permission.ACCESS_FINE_LOCATION
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text(
+                    text = "Server: ${socketUiState.status}",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (socketUiState.isConnected) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = socketUiState.detail,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (socketUiState.isConnected) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                Text(
+                    text = if (socketUiState.isConnected) {
+                        "App is ready. Hold the button to talk."
+                    } else {
+                        "Waiting for connection..."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (socketUiState.isConnected) {
+                        MaterialTheme.colorScheme.onPrimaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Button(
+                onClick = onConnectSocket,
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(text = if (socketUiState.isConnected) "Reconnect" else "Connect")
+            }
+            Button(
+                onClick = onDisconnectSocket,
+                modifier = Modifier.weight(1f),
+                enabled = socketUiState.isConnected
+            ) {
+                Text(text = "Disconnect")
+            }
+        }
+        Button(
+            onClick = {
+                if (!hasAudioPermission) {
+                    onRequestAudioPermission()
+                }
+            },
+            modifier = Modifier.size(220.dp),
+            shape = CircleShape,
+            interactionSource = interactionSource,
+            contentPadding = PaddingValues(24.dp),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = buttonContainerColor,
+                contentColor = buttonContentColor
+            ),
+            elevation = ButtonDefaults.buttonElevation(
+                defaultElevation = 8.dp,
+                pressedElevation = 2.dp
+            )
+        ) {
+            Text(
+                text = "Hold to Talk",
+                style = MaterialTheme.typography.titleLarge,
+                textAlign = TextAlign.Center
             )
         }
-        return permissions
-    }
-
-    private fun initializeBluetooth() {
-        if (!bluetoothAdapter.isEnabled) {
-            updateStatus("Bluetooth is off. Tap Enable Bluetooth.")
-            return
+        Text(
+            text = permissionStatusText(
+                hasAudioPermission = hasAudioPermission,
+                hasRequestedAudioPermission = hasRequestedAudioPermission,
+                shouldShowAudioPermissionRationale = shouldShowAudioPermissionRationale
+            ),
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (hasAudioPermission) {
+                MaterialTheme.colorScheme.onSurfaceVariant
+            } else {
+                MaterialTheme.colorScheme.error
+            },
+            textAlign = TextAlign.Center
+        )
+        Button(
+            onClick = onSendTestMessage,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = socketUiState.isConnected
+        ) {
+            Text(text = "Send Test Message")
         }
-
-        loadBondedDevices()
-        btManager.startServer(bluetoothAdapter)
-        updateStatus("Ready. Make one phone visible, scan from the other phone, then tap a device to pair.")
-    }
-
-    private fun loadBondedDevices() {
-        devices.clear()
-        bluetoothAdapter.bondedDevices.orEmpty().forEach { addOrUpdateDevice(it) }
-        rebuildDeviceList()
-    }
-
-    private fun requestBluetoothEnable() {
-        enableBluetoothLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
-    }
-
-    private fun requestDiscoverableMode() {
-        val discoverableIntent = Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE).apply {
-            putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 300)
-        }
-        discoverableLauncher.launch(discoverableIntent)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun startDiscovery() {
-        if (!bluetoothAdapter.isEnabled) {
-            requestBluetoothEnable()
-            return
-        }
-
-        loadBondedDevices()
-        bluetoothAdapter.cancelDiscovery()
-        val started = bluetoothAdapter.startDiscovery()
-        if (!started) {
-            updateStatus("Bluetooth scan could not start on this phone.")
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun connectToDevice(device: BluetoothDevice) {
-        updatePttEnabled(false)
-        updateStatus("Connecting to ${deviceLabel(device)}...")
-        btManager.connect(bluetoothAdapter, device)
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun addOrUpdateDevice(device: BluetoothDevice) {
-        devices[device.address] = device
-        rebuildDeviceList()
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun rebuildDeviceList() {
-        val labels = devices.values.map { device ->
-            val name = deviceLabel(device)
-            val state = when (device.bondState) {
-                BluetoothDevice.BOND_BONDED -> "paired"
-                BluetoothDevice.BOND_BONDING -> "pairing"
-                else -> "not paired"
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
+            )
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "Test Log",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                socketUiState.eventLog.forEach { logLine ->
+                    Text(
+                        text = logLine,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
-            "$name\n${device.address} • $state"
-        }
-
-        devicesAdapter.clear()
-        devicesAdapter.addAll(labels)
-        devicesAdapter.notifyDataSetChanged()
-    }
-
-    private fun updatePttEnabled(enabled: Boolean) {
-        pttButton.isEnabled = enabled
-        pttButton.alpha = if (enabled) 1f else 0.5f
-        if (!enabled) {
-            pttButton.text = "Hold To Talk"
         }
     }
+}
 
-    @SuppressLint("MissingPermission")
-    private fun deviceLabel(device: BluetoothDevice): String {
-        return device.name?.takeIf { it.isNotBlank() } ?: "Unknown device"
-    }
-
-    private fun registerDiscoveryReceiver() {
-        if (receiverRegistered) {
-            return
-        }
-
-        val filter = IntentFilter().apply {
-            addAction(BluetoothDevice.ACTION_FOUND)
-            addAction(BluetoothAdapter.ACTION_DISCOVERY_STARTED)
-            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
-            addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(discoveryReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(discoveryReceiver, filter)
-        }
-        receiverRegistered = true
-    }
-
-    private fun extractBluetoothDevice(intent: Intent): BluetoothDevice? {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
-        } else {
-            @Suppress("DEPRECATION")
-            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-        }
-    }
-
-    private fun updateStatus(message: String) {
-        statusText.text = message
-    }
-
-    private fun showToast(message: String) {
-        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
-    }
-
-    private fun shouldTransmitFrame(data: ByteArray): Boolean {
-        if (data.size < 2) {
-            return false
-        }
-
-        var sumSquares = 0.0
-        var samples = 0
-        var index = 0
-        while (index + 1 < data.size) {
-            val sample = ((data[index + 1].toInt() shl 8) or (data[index].toInt() and 0xFF)).toShort()
-            sumSquares += sample.toDouble() * sample.toDouble()
-            samples++
-            index += 2
-        }
-
-        if (samples == 0) {
-            return false
-        }
-
-        val rms = kotlin.math.sqrt(sumSquares / samples)
-        val now = android.os.SystemClock.elapsedRealtime()
-
-        if (isLocallyTransmitting) {
-            if (rms >= VOICE_GATE_THRESHOLD * 0.55) {
-                localTransmitHoldUntil = now + TRANSMIT_HANGOVER_MS
-                return true
-            }
-            return now <= localTransmitHoldUntil
-        }
-
-        val remoteAudioIsActive = now - lastRemoteAudioAt <= REMOTE_AUDIO_SUPPRESSION_MS
-        if (remoteAudioIsActive) {
-            return false
-        }
-
-        val shouldStartTransmit = rms >= VOICE_GATE_THRESHOLD
-        if (shouldStartTransmit) {
-            localTransmitHoldUntil = now + TRANSMIT_HANGOVER_MS
-        }
-        return shouldStartTransmit
-    }
-
-    private fun setLocalTransmitState(active: Boolean) {
-        if (isLocallyTransmitting == active) {
-            return
-        }
-
-        isLocallyTransmitting = active
-        if (!active) {
-            localTransmitHoldUntil = 0L
-        }
-        player.setMuted(active)
+private fun permissionStatusText(
+    hasAudioPermission: Boolean,
+    hasRequestedAudioPermission: Boolean,
+    shouldShowAudioPermissionRationale: Boolean
+): String {
+    return when {
+        hasAudioPermission -> "Microphone ready."
+        shouldShowAudioPermissionRationale -> "Microphone access is needed."
+        hasRequestedAudioPermission -> "Microphone permission denied."
+        else -> "Microphone access required."
     }
 }
