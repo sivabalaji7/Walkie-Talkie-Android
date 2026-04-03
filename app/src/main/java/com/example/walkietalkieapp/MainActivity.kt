@@ -89,6 +89,7 @@ class MainActivity : AppCompatActivity() {
                     val device = extractBluetoothDevice(intent)
                     if (device != null) {
                         addOrUpdateDevice(device)
+
                     }
                 }
 
